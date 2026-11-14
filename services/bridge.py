@@ -2,12 +2,10 @@ from __future__ import annotations
 from typing import (
     List,
     Optional,
+    Tuple,
     TYPE_CHECKING,
 )
 if TYPE_CHECKING:
-    from socket import (
-        socket as Socket,
-    )
     from asyncio import (
         StreamReader,
         StreamWriter,
@@ -22,7 +20,9 @@ import socket
 import asyncio
 
 from services.network import (
+    WarpInterfaceUnavailableError,
     bind_warp_interface,
+    enable_keepalive,
 )
 from config import settings
 
@@ -61,24 +61,27 @@ async def forward(
         writer.write_eof()
         await writer.drain()
 
-async def get_upstream_connection():
-    error: Optional[Exception] = None
+async def get_upstream_connection(
+) -> Tuple["StreamReader", "StreamWriter"]:
+    error: Optional[OSError] = None
+    loop = asyncio.get_running_loop()
 
     # 依次尝试 Cloudflare WARP 控制 API 的官方 IPv4 地址
     for c_ip4 in CLOUDFLARE_WARP_CONTROL_API_IPV4_IPS:
-        upstream_socket: Optional["Socket"] = None
+        # 创建 TCP Socket
+        # AF_INET: 使用 IPv4; SOCK_STREAM: 使用 TCP 协议
+        upstream_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # Socket 是否已交给 asyncio 接管, 未接管时在 finally 中关闭
+        handed_over = False
 
         try:
-            # 创建 TCP Socket
-            upstream_socket = socket.socket(
-                # AF_INET: 使用 IPv4
-                socket.AF_INET,
-                # SOCK_STREAM: 使用 TCP 协议
-                socket.SOCK_STREAM,
-            )
-
             # 将 Socket 绑定到 WARP 网络接口
+            # 接口不存在时抛出 WarpInterfaceUnavailableError
+            # 所有官方地址都走同一个接口, 因此不再尝试其他地址, 直接交给调用方
             bind_warp_interface(upstream_socket)
+
+            # 开启 keepalive, 隧道断开时及时发现失效连接
+            enable_keepalive(upstream_socket)
 
             # 设置为非阻塞模式
             upstream_socket.setblocking(False)
@@ -86,19 +89,19 @@ async def get_upstream_connection():
             try:
                 # 等待连接成功或超时
                 await asyncio.wait_for(
-                    asyncio.get_running_loop().sock_connect(
+                    loop.sock_connect(
                         upstream_socket,
                         (c_ip4, HTTPS_PORT),
                     ),
                     timeout=CONNECT_TIMEOUT,
                 )
-            # OSError 是 socket 连接失败时抛出的异常, 包括超时、拒绝连接等
+            # OSError 是 socket 连接失败时抛出的异常, 包括超时 (TimeoutError)、拒绝连接等
             except OSError as e:
                 error = e
                 # 当前 IP 连接失败后, 继续尝试下一个官方地址
-                logger.error(
-                    f"Failed to connect to Cloudflare API at {c_ip4}:443 "
-                    f"during {type(e).__name__}: {e}"
+                logger.warning(
+                    f"Failed to connect to Cloudflare API at "
+                    f"{c_ip4}:{HTTPS_PORT}: {type(e).__name__}: {e}"
                 )
                 continue
 
@@ -107,9 +110,7 @@ async def get_upstream_connection():
                 await asyncio.open_connection(
                     sock=upstream_socket
                 )
-
-            # 重新赋值为 None, 避免在 finally 中关闭 socket
-            upstream_socket = None
+            handed_over = True
 
             # 连接成功, 记录日志
             logger.info(
@@ -119,18 +120,9 @@ async def get_upstream_connection():
             # 连接成功, 返回 StreamReader 和 StreamWriter
             return upstream_reader, upstream_writer
 
-        except Exception as e:
-            error = e
-            # 非预期错误, 输出完整 Traceback 并向调用方抛出
-            logger.exception(
-                f"Unexpected error at {c_ip4}:{HTTPS_PORT} "
-                f"during {type(e).__name__}: {e}"
-            )
-            raise
-
         finally:
             # 释放未被 asyncio 接管的 Socket
-            if upstream_socket is not None:
+            if not handed_over:
                 upstream_socket.close()
 
     if error is not None:
@@ -151,9 +143,6 @@ async def handle_tcp_connection(
         # 获取连接到本地 TCP Bridge 的客户端地址
         # "peername" 是 asyncio 查询的固定字段
         client_peername = client_writer.get_extra_info("peername")
-        # logger.info(
-        #     f"WARP client connected: {client_peername}"
-        # )
 
         if client_peername is None:
             raise ValueError(
@@ -188,17 +177,24 @@ async def handle_tcp_connection(
                 forward(upstream_reader, client_writer)
             ),
         ]
-        # 等待任意一个任务完成或抛出异常, 立即返回 (已经完成任务, 还没有完成的任务)
-        # 还没有完成任务不会自动取消
+        # FIRST_EXCEPTION: 任意一个任务抛出异常时立即返回
+        # 如果没有任务抛出异常, 则等到两个任务都正常结束 (等同于 ALL_COMPLETED)
+        # 因此一个方向先读到 EOF 时, 另一个方向会继续转发, 支持 TCP 半关闭
         completed, _ = await asyncio.wait(
             tasks,
-            # asyncio.FIRST_EXCEPTION: 当任意一个任务完成或抛出异常时, 立即返回
             return_when=asyncio.FIRST_EXCEPTION,
         )
 
         # 检查已完成任务是否发生异常
         for c_t in completed:
             c_t.result() # 如果任务发生异常, 这里会抛出异常, 进入 except 块
+
+    except WarpInterfaceUnavailableError as e:
+        # WARP 隧道尚未建立或正在重连, 属于预期情况
+        # 关闭本次连接即可, warp-svc 会自行重试
+        logger.warning(
+            f"WARP interface not ready, API connection dropped: {e.strerror}"
+        )
 
     except OSError as e:
         # 网络或系统调用失败, 记录错误并关闭当前 TCP 连接
@@ -207,20 +203,16 @@ async def handle_tcp_connection(
             f"{type(e).__name__}: {e!r}"
         )
 
-    except Exception as e:
-        # 非预期错误, 输出完整 Traceback 并向调用方抛出
-        logger.exception(
-            f"Unexpected TCP bridge error: "
-            f"{type(e).__name__}: {e}"
-        )
-        raise
+    except Exception:
+        # 非预期错误, 在这里输出一次完整 Traceback
+        # 不再向上抛出, 避免在任务回调中重复记录
+        logger.exception("Unexpected TCP bridge error.")
 
     finally:
         for t in tasks:
             # 如果任务还没有完成, 取消
             if not t.done():
                 t.cancel()
-
 
         if tasks:
             # 等待所有任务完成, 并忽略异常

@@ -14,6 +14,11 @@ if TYPE_CHECKING:
         optname: int
         value: bytes
 
+    class KeepaliveOption(TypedDict):
+        level: int
+        optname: int
+        value: int
+
 from pydantic import (
     IPvAnyAddress,
     Field,
@@ -28,6 +33,7 @@ from pydantic_settings import (
 )
 
 import sys
+import signal
 import socket
 import struct
 
@@ -89,6 +95,26 @@ class Settings(BaseSettings):
         description="Upstream connection timeout in seconds."
     )
 
+    # 上游 TCP keepalive: 连接空闲多少秒后开始探测
+    # 隧道中途断开时, 用于及时发现并关闭失效的上游连接
+    keepalive_idle: int = Field(
+        default=30,
+        ge=1,
+        description="Seconds of idle time before TCP keepalive probes start."
+    )
+    # 上游 TCP keepalive: 两次探测之间的间隔 (秒)
+    keepalive_interval: int = Field(
+        default=10,
+        ge=1,
+        description="Seconds between TCP keepalive probes."
+    )
+    # 上游 TCP keepalive: 连续多少次探测无响应后判定连接失效
+    keepalive_count: int = Field(
+        default=3,
+        ge=1,
+        description="Unanswered TCP keepalive probes before the connection is dropped."
+    )
+
     # =================== Cloudflare WARP 控制 API 配置 ====================
     # Cloudflare WARP 控制 API 官方地址
     # https://developers.cloudflare.com/cloudflare-one/team-and-resources/devices/cloudflare-one-client/deployment/firewall/
@@ -103,7 +129,7 @@ class Settings(BaseSettings):
             "162.159.137.105",
             "162.159.138.105",
         )
-    # Cloudflare WARP  名称
+    # Cloudflare WARP 网络接口名称
     cloudflare_warp_interface_name: ClassVar[str] = "CloudflareWARP"
 
     # Https 默认统一端口
@@ -116,12 +142,53 @@ class Settings(BaseSettings):
         description="Custom MASQUE tunnel endpoint (IPv4:UDP port).",
     )
 
-    # 系统 Socket 选项, 由模型初始化时确定
-    # 这些内部属性不参与环境变量解析
+    # =================== 启停流程配置 ===================
+    # 启动脚本等待 warp-svc 可以响应命令的最长时间 (秒)
+    warp_svc_wait_timeout: int = Field(
+        default=30,
+        ge=1,
+        description="Seconds the start script waits for warp-svc to respond.",
+    )
+    # 运行期间刷新 sudo 授权的间隔 (秒)
+    # 必须小于 sudo 授权有效期 (默认 15 分钟), 保证退出时 close 脚本仍有授权
+    sudo_refresh_interval: int = Field(
+        default=60,
+        ge=1,
+        description="Seconds between sudo authorization refreshes while running.",
+    )
+    # 发出连接命令后, 等待 WARP 真正连上的最长时间 (秒)
+    # 超时只记录警告, 不中断服务
+    warp_connect_wait_timeout: float = Field(
+        default=60.0,
+        gt=0,
+        description="Seconds to wait for WARP to report Connected.",
+    )
+    # close 脚本的最长执行时间 (秒), 避免恢复步骤卡住导致进程无法退出
+    close_command_timeout: float = Field(
+        default=60.0,
+        gt=0,
+        description="Seconds before the close script is killed.",
+    )
+
+    # =================== 平台相关配置 ===================
+    # 以下内部属性由模型初始化时按平台确定, 不参与环境变量解析
+    # 其他模块只读取对应属性, 不再自行判断平台
+    # 将上游 Socket 绑定到 WARP 网络接口的 Socket 选项
     _socket_options: "Optional[SocketOptions]" = PrivateAttr(default=None)
+    # 上游 Socket 的 keepalive 选项
+    _keepalive_options: "Optional[List[KeepaliveOption]]" = \
+        PrivateAttr(default=None)
+    # 需要转为 SIGTERM, 走优雅关闭流程的平台退出信号
+    _shutdown_signals: Optional[Tuple[int, ...]] = PrivateAttr(default=None)
 
     @model_validator(mode="after")
-    def init_socket_options(self) -> Self:
+    def init_platform_options(self) -> Self:
+        # 已发送数据长时间未被确认时的超时 (毫秒)
+        user_timeout_ms = (
+            self.keepalive_idle
+            + self.keepalive_interval * self.keepalive_count
+        ) * 1000
+
         # Linux
         if sys.platform == "linux":
             self._socket_options = {
@@ -130,16 +197,19 @@ class Settings(BaseSettings):
                 "value": self.cloudflare_warp_interface_name.encode("utf-8") \
                     + b'\0',     # WARP 网络接口名称
             }
+            self._keepalive_options = [
+                {"level": socket.SOL_SOCKET, "optname": socket.SO_KEEPALIVE, "value": 1},
+                {"level": socket.IPPROTO_TCP, "optname": socket.TCP_KEEPIDLE, "value": self.keepalive_idle},
+                {"level": socket.IPPROTO_TCP, "optname": socket.TCP_KEEPINTVL, "value": self.keepalive_interval},
+                {"level": socket.IPPROTO_TCP, "optname": socket.TCP_KEEPCNT, "value": self.keepalive_count},
+                {"level": socket.IPPROTO_TCP, "optname": socket.TCP_USER_TIMEOUT, "value": user_timeout_ms},
+            ]
+            # 关闭终端窗口
+            self._shutdown_signals = (signal.SIGHUP, )
 
         # Windows
         elif sys.platform == "win32":
-            # ~ 未来更改
-            if self.cloudflare_warp_interface_name is None:
-                raise ValueError(
-                    "WARP interface name must be provided on Windows."
-                )
-
-            # 根据手动提供的接口名称获取 Windows 网络接口索引
+            # 根据接口名称获取 Windows 网络接口索引
             interface_index: int = socket.if_nametoindex(
                 self.cloudflare_warp_interface_name
             )
@@ -148,6 +218,14 @@ class Settings(BaseSettings):
                 "optname": 31,              # IP_UNICAST_IF
                 "value": struct.pack("!I", interface_index),
             }
+            self._keepalive_options = [
+                {"level": socket.SOL_SOCKET, "optname": socket.SO_KEEPALIVE, "value": 1},
+                {"level": socket.IPPROTO_TCP, "optname": socket.TCP_KEEPIDLE, "value": self.keepalive_idle},
+                {"level": socket.IPPROTO_TCP, "optname": socket.TCP_KEEPINTVL, "value": self.keepalive_interval},
+                {"level": socket.IPPROTO_TCP, "optname": socket.TCP_KEEPCNT, "value": self.keepalive_count},
+            ]
+            # 控制台 Ctrl+Break
+            self._shutdown_signals = (signal.SIGBREAK, )
 
         # MacOS
         elif sys.platform == "darwin":
@@ -156,7 +234,7 @@ class Settings(BaseSettings):
             )
         # Other platforms
         else:
-            raise NotImplementedError(                    # pyright: ignore
+            raise NotImplementedError(
                 f"Unsupported platform: {sys.platform}"
             )
         return self
@@ -168,6 +246,22 @@ class Settings(BaseSettings):
                 "Socket options not initialized. "
             )
         return self._socket_options
+
+    @property
+    def keepalive_options(self) -> "List[KeepaliveOption]":
+        if self._keepalive_options is None:
+            raise RuntimeError(
+                "Keepalive options not initialized. "
+            )
+        return self._keepalive_options
+
+    @property
+    def shutdown_signals(self) -> Tuple[int, ...]:
+        if self._shutdown_signals is None:
+            raise RuntimeError(
+                "Shutdown signals not initialized. "
+            )
+        return self._shutdown_signals
 
     model_config = SettingsConfigDict(
         env_file=[".env", ],
