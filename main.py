@@ -89,9 +89,6 @@ async def run_command(
             str(command_file),
             *SHARED_COMMAND_ARGS,
         ]
-        raise NotImplementedError(
-            "Windows platform is not supported yet."
-        )
     # 其余平台不支持
     else:
         raise NotImplementedError(
@@ -167,7 +164,7 @@ async def lifespan(
     tcp_connections = TCPConnections()
     tcp_server = await asyncio.start_server(
         tcp_connections.accept,
-        host=TCP_HOST,
+        host=str(TCP_HOST),
         port=TCP_PORT,
     )
     # 打印日志

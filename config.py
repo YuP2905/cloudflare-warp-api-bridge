@@ -34,7 +34,6 @@ from pydantic_settings import (
 import sys
 import signal
 import socket
-import struct
 
 class Settings(BaseSettings):
     # =================== 模式配置 ===================
@@ -165,20 +164,10 @@ class Settings(BaseSettings):
     # =================== 平台相关配置 ===================
     # 以下内部属性由模型初始化时按平台确定, 不参与环境变量解析
     # 其他模块只读取对应属性, 不再自行判断平台
-    # 将上游 Socket 绑定到 WARP 网络接口的 Socket 选项
-    _socket_options: "Optional[SocketOptions]" = PrivateAttr(default=None)
     # 上游 Socket 的 keepalive 选项
     _keepalive_options: "Optional[List[KeepaliveOption]]" = PrivateAttr(default=None)
     # 平台退出信号
     _shutdown_signals: Optional[Tuple[int]] = PrivateAttr(default=None)
-
-    @property
-    def socket_options(self):
-        if self._socket_options is None:
-            raise RuntimeError(
-                "Socket options not initialized. "
-            )
-        return self._socket_options
 
     @property
     def keepalive_options(self):
@@ -230,12 +219,6 @@ if sys.platform == "linux":
                 + self.keepalive_interval * self.keepalive_count
             ) * 1000
 
-            self._socket_options = {
-                "level": socket.SOL_SOCKET,              # 1, socket 通用设置
-                "optname": socket.SO_BINDTODEVICE,       # 25, 绑定到指定网络接口
-                "value": self.cloudflare_warp_interface_name.encode("utf-8") \
-                    + b'\0',                             # 指定的网络接口名称 "CloudflareWARP" + b'\0'(0 字节, 字符串结束标记)
-            }
             self._keepalive_options = [
                 {
                     "level": socket.SOL_SOCKET,          # 1, socket 通用选项
@@ -269,25 +252,83 @@ if sys.platform == "linux":
             )
             return self
 
+        def get_socket_options(self):
+            # 将上游 Socket 绑定到 WARP 网络接口的 Socket 选项
+            # Linux 的 SO_BINDTODEVICE 直接使用网络接口名称, 内容固定不变
+            # 由内核在每次 setsockopt 时查找网络接口, 不存在时抛出 ENODEV
+            socket_options: "SocketOptions" = {
+                "level": socket.SOL_SOCKET,              # 1, socket 通用设置
+                "optname": socket.SO_BINDTODEVICE,       # 25, 绑定到指定网络接口
+                "value": self.cloudflare_warp_interface_name.encode("utf-8") \
+                    + b'\0',                             # 指定的网络接口名称 "CloudflareWARP" + b'\0'(0 字节, 字符串结束标记)
+            }
+            return socket_options
+
     settings = LinuxSettings()
 
 # =================== Windows ===================
-# ~ Furture Work (未来计划, 仅针对 win11 22H2 及以上版本, 其他版本不打算测试和支持)
 elif sys.platform == "win32":
+    import errno
+    import struct
+    import ctypes
+    from ctypes import (
+        wintypes,
+        Structure,
+    )
+
+    # Windows 网络接口的唯一标识 LUID, 对应 C 结构体 NET_LUID
+    class NET_LUID(Structure):
+        _fields_ = [
+            ("Value", ctypes.c_ulonglong),
+        ]
+
+    # Windows IP Helper API, 用于查询网络接口信息
+    IPHLPAPI = ctypes.WinDLL("iphlpapi")
+
+    def get_interface_index(
+        interface_name: str,
+    ):
+        # 根据网络接口名称 (例如 "CloudflareWARP") 获取 Windows 网络接口索引
+        # socket.if_nametoindex 在 Windows 上只认 "ethernet_0" 这类内部名称, 不认网络接口名称
+        # 因此通过 IP Helper 分两步查找: 网络接口名称 --> LUID --> 网络接口索引
+        luid = NET_LUID()
+        interface_index = wintypes.ULONG()
+
+        # 两个函数都返回 0 表示成功
+        # 网络接口不存在时 (例如 WARP 未连接), 第一步返回 87 (ERROR_INVALID_PARAMETER)
+        is_interface_found = IPHLPAPI.ConvertInterfaceAliasToLuid(
+            interface_name,
+            ctypes.byref(luid),
+        ) == 0 \
+        and IPHLPAPI.ConvertInterfaceLuidToIndex(
+            ctypes.byref(luid),
+            ctypes.byref(interface_index),
+        ) == 0
+
+        if not is_interface_found:
+            # 与 Linux 绑定不存在的网络接口时的错误保持一致
+            # services/network.py 会将 ENODEV 转换为 WarpInterfaceUnavailableError
+            raise OSError(
+                errno.ENODEV,   # 19, 设备不存在
+                f"WARP interface '{interface_name}' not found.",
+            )
+        return interface_index.value
+
     class WindowsSettings(Settings):
         # Windows 平台的设置
 
+        # 本地 TCP 桥接服务的监听端口
+        # Windows 没有特权端口限制, 直接监听 443, 不要像 Linux 那样用 iptables 转发
+        # 没有端口转发, 因此只能是 443 (ge=443, le=443), 改成其他值会在启动时校验失败
+        tcp_port: int = Field(
+            default=443,
+            ge = 443,
+            le = 443,
+            description="TCP port."
+        )
+
         @model_validator(mode="after")
         def init_platform_options(self):
-            # 根据接口名称获取 Windows 网络接口索引
-            interface_index: int = socket.if_nametoindex(
-                self.cloudflare_warp_interface_name
-            )
-            self._socket_options =  {
-                "level": socket.IPPROTO_IP,                  # 0
-                "optname": 31,                               # IP_UNICAST_IF
-                "value": struct.pack("!I", interface_index),
-            }
             self._keepalive_options = [
                 {
                     "level": socket.SOL_SOCKET,             # 1, socket 通用选项
@@ -315,6 +356,20 @@ elif sys.platform == "win32":
                 signal.SIGBREAK, # signal 21, 控制台 Ctrl+Break
             )
             return self
+
+        def get_socket_options(self):
+            # 将上游 Socket 绑定到 WARP 网络接口的 Socket 选项
+            # Windows 的 IP_UNICAST_IF 需要网络接口索引, 不能直接使用网络接口名称
+            # 每次绑定时重新获取: WARP 连接后才会创建该网络接口, 重新连接后索引可能变化
+            interface_index = get_interface_index(
+                self.cloudflare_warp_interface_name
+            )
+            socket_options: "SocketOptions" = {
+                "level": socket.IPPROTO_IP,                   # 0
+                "optname": 31,                                # IP_UNICAST_IF
+                "value": struct.pack("!I", interface_index),  # 将网络接口索引转换为 4 字节的网络字节序 bytes
+            }
+            return socket_options
 
     settings = WindowsSettings()
 

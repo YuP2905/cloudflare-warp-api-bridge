@@ -13,7 +13,6 @@ import errno
 from config import settings
 
 WARP_INTERFACE_NAME = settings.cloudflare_warp_interface_name  # WARP 网络接口名称
-SOCKET_OPTIONS = settings.socket_options                       # TCP Socket 选项, 用于绑定 WARP 网络接口
 KEEPALIVE_OPTIONS = settings.keepalive_options                 # TCP Socket Keepalive 选项, 用于定期探测连接状态
 
 class WarpInterfaceUnavailableError(OSError):
@@ -24,6 +23,7 @@ def bind_socket_to_warp_network_interface(
     upstream_socket: "Socket",
 ):
     try:
+        SOCKET_OPTIONS = settings.get_socket_options()
         upstream_socket.setsockopt(
             SOCKET_OPTIONS["level"],
             SOCKET_OPTIONS["optname"],
