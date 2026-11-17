@@ -11,7 +11,6 @@ if TYPE_CHECKING:
     )
 
 from uvicorn.config import logger
-
 import asyncio
 
 from services.bridge import (
@@ -19,51 +18,72 @@ from services.bridge import (
 )
 
 class TCPConnections:
-    def __init__(self) -> None:
+    def __init__(self):
+        # 初始化客户端连接: { 正在转发任务: 对应客户端的 StreamWriter }
         self._connections: Dict["Task[None]", "StreamWriter"] = {}
-        # 记录是否正在关闭, 避免在关闭过程中接入新的 TCP 客户端
+        # 初始化关闭标志
+        # self.close() 方法设置为 True
         self._closing = False
 
     def accept(
         self,
         client_reader: "StreamReader",
         client_writer: "StreamWriter",
-    ) -> None:
+    ):
+        # 如果正在关闭, 不 create_task, 直接关闭客户端连接
         if self._closing:
             client_writer.close()
             return
+
+        # 创建转发任务 (只是排队, 需要事件循环调度, 才会执行)
         task = asyncio.create_task(
             handle_tcp_connection(client_reader, client_writer)
         )
+        # 记录任务和对应的客户端 StreamWriter
         self._connections[task] = client_writer
+
+        # 任务完成(正常结束/抛异常/被取消), 调用 _discard 方法清理记录
         task.add_done_callback(self._discard)
 
     def _discard(
         self,
         task: "Task[None]",
-    ) -> None:
+    ):
+        # 移除任务和对应的客户端 StreamWriter
+        # 并得到移除的客户端 StreamWriter
         client_writer = self._connections.pop(task)
+        # 获取客户端 HOST 和 PORT
+        client_peername = client_writer.get_extra_info("peername")
+        client_address = ':'.join(map(str, client_peername)) \
+            if client_peername is not None else "unknown"
 
-        # 任务可能在首次执行前被取消, 未进入处理函数的 finally
-        # 因此这里确保客户端连接关闭, 重复 close 是允许的
+        # 关闭客户端的 TCP Socket
         client_writer.close()
 
-        # 处理函数会自行记录所有 Exception, 这里只兜底意外逃逸的异常
+        # 如果任务没有被取消
         if not task.cancelled():
+            # 获取任务的异常信息
             error = task.exception()
             if error is not None:
-                logger.error("TCP connection task failed.", exc_info=error)
+                logger.error(
+                    "WARP TCP bridge task failed: "
+                    f"client={client_address}.",
+                    exc_info=error, # 打印异常堆栈
+                )
 
-    async def close(self) -> None:
+    async def close(self):
+        # 设置关闭为 True
         self._closing = True
 
-        # 完成回调会移除任务, 使用快照固定本次需要等待的对象
-        pending = tuple(self._connections)
-        for task in pending:
-            task.cancel()
+        # 拷贝当前的连接任务列表, 避免 self._discard 在取消任务时修改 self._connections
+        pending_tasks = tuple(self._connections)
+        # 取消所有正在转发的任务
+        for p_t in pending_tasks:
+            p_t.cancel()
 
-        if pending:
+        # 等待所有任务完成, 忽略异常
+        if pending_tasks:
             await asyncio.gather(
-                *pending,
+                *pending_tasks,
                 return_exceptions=True,
             )

@@ -4,11 +4,10 @@
 TCP_HOST="$1"
 TCP_PORT="$2"
 HTTPS_PORT="$3"
-
 # 网络适配配置
 WARP_TUNNEL_ENDPOINT="$4"
 
-# 恢复时继续执行每一项清理, 不使用 set -e 提前退出
+# 恢复时继续执行每一项清理
 # 0 表示全部成功; 任意一步失败后保留为 1, 最后交给 Python 判断
 EXIT_CODE=0
 

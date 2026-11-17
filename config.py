@@ -3,7 +3,6 @@ from typing import (
     List,
     Tuple,
     Optional,
-    Self,
     ClassVar,
     TypedDict,
     TYPE_CHECKING,
@@ -82,7 +81,7 @@ class Settings(BaseSettings):
 
     # TCP 单次读取最大字节数
     chunk_size: int = Field(
-        default=65536,
+        default=65536,  # 64KB, 65536 字节
         # 单次读取的最大字节数不能小于 1024
         ge=1024,
         description="Maximum TCP read size in bytes."
@@ -142,19 +141,12 @@ class Settings(BaseSettings):
         description="Custom MASQUE tunnel endpoint (IPv4:UDP port).",
     )
 
-    # =================== 启停流程配置 ===================
+    # =================== 启停脚本流程配置 ===================
     # 启动脚本等待 warp-svc 可以响应命令的最长时间 (秒)
     warp_svc_wait_timeout: int = Field(
         default=30,
         ge=1,
         description="Seconds the start script waits for warp-svc to respond.",
-    )
-    # 运行期间刷新 sudo 授权的间隔 (秒)
-    # 必须小于 sudo 授权有效期 (默认 15 分钟), 保证退出时 close 脚本仍有授权
-    sudo_refresh_interval: int = Field(
-        default=60,
-        ge=1,
-        description="Seconds between sudo authorization refreshes while running.",
     )
     # 发出连接命令后, 等待 WARP 真正连上的最长时间 (秒)
     # 超时只记录警告, 不中断服务
@@ -176,71 +168,12 @@ class Settings(BaseSettings):
     # 将上游 Socket 绑定到 WARP 网络接口的 Socket 选项
     _socket_options: "Optional[SocketOptions]" = PrivateAttr(default=None)
     # 上游 Socket 的 keepalive 选项
-    _keepalive_options: "Optional[List[KeepaliveOption]]" = \
-        PrivateAttr(default=None)
-    # 需要转为 SIGTERM, 走优雅关闭流程的平台退出信号
-    _shutdown_signals: Optional[Tuple[int, ...]] = PrivateAttr(default=None)
-
-    @model_validator(mode="after")
-    def init_platform_options(self) -> Self:
-        # 已发送数据长时间未被确认时的超时 (毫秒)
-        user_timeout_ms = (
-            self.keepalive_idle
-            + self.keepalive_interval * self.keepalive_count
-        ) * 1000
-
-        # Linux
-        if sys.platform == "linux":
-            self._socket_options = {
-                "level": socket.SOL_SOCKET,        # 1
-                "optname": socket.SO_BINDTODEVICE, # 25
-                "value": self.cloudflare_warp_interface_name.encode("utf-8") \
-                    + b'\0',     # WARP 网络接口名称
-            }
-            self._keepalive_options = [
-                {"level": socket.SOL_SOCKET, "optname": socket.SO_KEEPALIVE, "value": 1},
-                {"level": socket.IPPROTO_TCP, "optname": socket.TCP_KEEPIDLE, "value": self.keepalive_idle},
-                {"level": socket.IPPROTO_TCP, "optname": socket.TCP_KEEPINTVL, "value": self.keepalive_interval},
-                {"level": socket.IPPROTO_TCP, "optname": socket.TCP_KEEPCNT, "value": self.keepalive_count},
-                {"level": socket.IPPROTO_TCP, "optname": socket.TCP_USER_TIMEOUT, "value": user_timeout_ms},
-            ]
-            # 关闭终端窗口
-            self._shutdown_signals = (signal.SIGHUP, )
-
-        # Windows
-        elif sys.platform == "win32":
-            # 根据接口名称获取 Windows 网络接口索引
-            interface_index: int = socket.if_nametoindex(
-                self.cloudflare_warp_interface_name
-            )
-            self._socket_options =  {
-                "level": socket.IPPROTO_IP, # 0
-                "optname": 31,              # IP_UNICAST_IF
-                "value": struct.pack("!I", interface_index),
-            }
-            self._keepalive_options = [
-                {"level": socket.SOL_SOCKET, "optname": socket.SO_KEEPALIVE, "value": 1},
-                {"level": socket.IPPROTO_TCP, "optname": socket.TCP_KEEPIDLE, "value": self.keepalive_idle},
-                {"level": socket.IPPROTO_TCP, "optname": socket.TCP_KEEPINTVL, "value": self.keepalive_interval},
-                {"level": socket.IPPROTO_TCP, "optname": socket.TCP_KEEPCNT, "value": self.keepalive_count},
-            ]
-            # 控制台 Ctrl+Break
-            self._shutdown_signals = (signal.SIGBREAK, )
-
-        # MacOS
-        elif sys.platform == "darwin":
-            raise NotImplementedError(
-                f"Unsupported platform: {sys.platform}"
-            )
-        # Other platforms
-        else:
-            raise NotImplementedError(
-                f"Unsupported platform: {sys.platform}"
-            )
-        return self
+    _keepalive_options: "Optional[List[KeepaliveOption]]" = PrivateAttr(default=None)
+    # 平台退出信号
+    _shutdown_signals: Optional[Tuple[int]] = PrivateAttr(default=None)
 
     @property
-    def socket_options(self) -> "SocketOptions":
+    def socket_options(self):
         if self._socket_options is None:
             raise RuntimeError(
                 "Socket options not initialized. "
@@ -248,7 +181,7 @@ class Settings(BaseSettings):
         return self._socket_options
 
     @property
-    def keepalive_options(self) -> "List[KeepaliveOption]":
+    def keepalive_options(self):
         if self._keepalive_options is None:
             raise RuntimeError(
                 "Keepalive options not initialized. "
@@ -256,7 +189,7 @@ class Settings(BaseSettings):
         return self._keepalive_options
 
     @property
-    def shutdown_signals(self) -> Tuple[int, ...]:
+    def shutdown_signals(self):
         if self._shutdown_signals is None:
             raise RuntimeError(
                 "Shutdown signals not initialized. "
@@ -276,4 +209,125 @@ class Settings(BaseSettings):
         case_sensitive=True,
     )
 
-settings = Settings()
+# ================== Linux ===================
+if sys.platform == "linux":
+    class LinuxSettings(Settings):
+        # Linux 平台的设置
+
+        # 运行期间刷新 sudo 授权的间隔 (秒)
+        # 必须小于 sudo 授权有效期 (默认 15 分钟), 保证退出时仍有授权
+        sudo_refresh_interval: int = Field(
+            default=60,
+            ge=1,
+            description="Seconds between sudo authorization refreshes while running.",
+        )
+
+        @model_validator(mode="after")
+        def init_platform_options(self):
+            # 已发送数据长时间未被确认时的超时 (毫秒)
+            user_timeout_ms = (
+                self.keepalive_idle
+                + self.keepalive_interval * self.keepalive_count
+            ) * 1000
+
+            self._socket_options = {
+                "level": socket.SOL_SOCKET,              # 1, socket 通用设置
+                "optname": socket.SO_BINDTODEVICE,       # 25, 绑定到指定网络接口
+                "value": self.cloudflare_warp_interface_name.encode("utf-8") \
+                    + b'\0',                             # 指定的网络接口名称 "CloudflareWARP" + b'\0'(0 字节, 字符串结束标记)
+            }
+            self._keepalive_options = [
+                {
+                    "level": socket.SOL_SOCKET,          # 1, socket 通用选项
+                    "optname": socket.SO_KEEPALIVE,      # 9, 是否启用 keepalive(存活) 探测
+                    "value": 1                           # 1, 启用. 0 表示禁用
+                },
+                {
+                    "level": socket.IPPROTO_TCP,         # 6, TCP 协议选项
+                    "optname": socket.TCP_KEEPIDLE,      # 4, 空闲多少秒后开始探测
+                    "value": self.keepalive_idle         # 连续空闲 self.keepalive_idle 秒后开始探测
+                },
+                {
+                    "level": socket.IPPROTO_TCP,         # 6, TCP 协议选项
+                    "optname": socket.TCP_KEEPINTVL,     # 5, 两次探测之间的间隔
+                    "value": self.keepalive_interval     # 连续两次探测之间的间隔为 self.keepalive_interval 秒
+                },
+                {
+                    "level": socket.IPPROTO_TCP,         # 6, TCP 协议选项
+                    "optname": socket.TCP_KEEPCNT,       # 6, 连续多少次探测无响应后判定连接失效
+                    "value": self.keepalive_count        # 连续 self.keepalive_count 次探测无响应后判定连接失效
+                },
+                {
+                    "level": socket.IPPROTO_TCP,         # 6, TCP 协议选项
+                    "optname": socket.TCP_USER_TIMEOUT,  # 18, 已发送数据长时间未被确认时的超时
+                    "value": user_timeout_ms             # 超时为 user_timeout_ms 毫秒
+                },
+            ]
+            # 关闭终端窗口
+            self._shutdown_signals = (
+                signal.SIGHUP,  # signal 1, 终端关闭
+            )
+            return self
+
+    settings = LinuxSettings()
+
+# =================== Windows ===================
+# ~ Furture Work (未来计划, 仅针对 win11 22H2 及以上版本, 其他版本不打算测试和支持)
+elif sys.platform == "win32":
+    class WindowsSettings(Settings):
+        # Windows 平台的设置
+
+        @model_validator(mode="after")
+        def init_platform_options(self):
+            # 根据接口名称获取 Windows 网络接口索引
+            interface_index: int = socket.if_nametoindex(
+                self.cloudflare_warp_interface_name
+            )
+            self._socket_options =  {
+                "level": socket.IPPROTO_IP,                  # 0
+                "optname": 31,                               # IP_UNICAST_IF
+                "value": struct.pack("!I", interface_index),
+            }
+            self._keepalive_options = [
+                {
+                    "level": socket.SOL_SOCKET,             # 1, socket 通用选项
+                    "optname": socket.SO_KEEPALIVE,         # 9, socket 保活选项
+                    "value": 1                              # 1, 启用. 0 表示禁用
+                },
+                {
+                    "level": socket.IPPROTO_TCP,            # 6, TCP 协议选项
+                    "optname": socket.TCP_KEEPIDLE,         # 4, 空闲多少秒后开始探测
+                    "value": self.keepalive_idle            # 连续空闲 self.keepalive_idle 秒后开始探测
+                },
+                {
+                    "level": socket.IPPROTO_TCP,            # 6, TCP 协议选项
+                    "optname": socket.TCP_KEEPINTVL,        # 5, 两次探测之间的间隔
+                    "value": self.keepalive_interval        # 连续两次探测之间的间隔为 self.keepalive_interval 秒
+                },
+                {
+                    "level": socket.IPPROTO_TCP,            # 6, TCP 协议选项
+                    "optname": socket.TCP_KEEPCNT,          # 6, 连续多少次探测无响应后判定连接失效
+                    "value": self.keepalive_count           # 连续 self.keepalive_count 次探测无响应后判定连接失效
+                },
+            ]
+            # 控制台 Ctrl+Break
+            self._shutdown_signals = (
+                signal.SIGBREAK, # signal 21, 控制台 Ctrl+Break
+            )
+            return self
+
+    settings = WindowsSettings()
+
+# =================== macOS ===================
+# ! Not Gonna Work (不打算支持, 仅用于抛出异常提示)
+elif sys.platform == "darwin":
+    raise NotImplementedError(
+        "I'm not gonna support MacOS. Because I don't like f**king closed systems like MacOS."
+    )
+# =================== 其他平台 ===================
+# ! 本人孤陋寡闻, 仅知道 windows 和 linux (仅用于抛出异常提示, 更不会支持了)
+else:
+    raise NotImplementedError(
+        f"Forgive my ignorance, I really don't know what platform '{sys.platform}' is, "
+        "and I'm not gonna support it."
+    )

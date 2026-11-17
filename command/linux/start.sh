@@ -5,7 +5,6 @@ set -e
 TCP_HOST="$1"
 TCP_PORT="$2"
 HTTPS_PORT="$3"
-
 # 网络适配配置
 WARP_TUNNEL_ENDPOINT="$4"
 

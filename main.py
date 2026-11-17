@@ -6,8 +6,8 @@ from typing import (
     TYPE_CHECKING,
 )
 if TYPE_CHECKING:
-    from collections.abc import (
-        AsyncGenerator,
+    from asyncio import (
+        Task,
     )
 
 from contextlib import (
@@ -40,56 +40,71 @@ from config import (
     settings,
 )
 
-TCP_HOST = settings.tcp_host
-TCP_PORT = settings.tcp_port
-BLOCK_IPS = settings.block_ips
-HTTPS_PORT = settings.https_port
-DEV_MODE = settings.dev_mode
-# 网络适配配置
-WARP_TUNNEL_ENDPOINT = settings.warp_tunnel_endpoint
+TCP_HOST = settings.tcp_host                                         # TCP 服务监听的 HOST,
+TCP_PORT = settings.tcp_port                                         # TCP 服务监听的 PORT
+BLOCK_IPS = settings.block_ips                                       # IP 黑名单
+HTTPS_PORT = settings.https_port                                     # 约定俗成的 HTTPS 统一端口
+DEV_MODE = settings.dev_mode                                         # 开发模式
+WARP_TUNNEL_ENDPOINT = settings.warp_tunnel_endpoint                 # WARP Tunnel 隧道入口
 
-# 启停流程配置
-WARP_SVC_WAIT_TIMEOUT = settings.warp_svc_wait_timeout
-SUDO_REFRESH_INTERVAL = settings.sudo_refresh_interval
-WARP_CONNECT_WAIT_TIMEOUT = settings.warp_connect_wait_timeout
-CLOSE_COMMAND_TIMEOUT = settings.close_command_timeout
+WARP_SVC_WAIT_TIMEOUT = settings.warp_svc_wait_timeout               # WARP 服务启动等待超时时间 (单位: 秒)
+WARP_CONNECT_WAIT_TIMEOUT = settings.warp_connect_wait_timeout       # WARP 连接等待超时时间 (单位: 秒)
+CLOSE_COMMAND_TIMEOUT = settings.close_command_timeout               # 关闭命令超时时间 (单位: 秒)
 
+# 项目根目录
 PROJECT_ROOT = Path(__file__).resolve().parent
+# 共用脚本路径
+SHARED_COMMAND_DIR_PATH = PROJECT_ROOT / "command"
+# 共用脚本参数
+SHARED_COMMAND_ARGS = [
+    TCP_HOST,                       # $1
+    str(TCP_PORT),                  # $2
+    str(HTTPS_PORT),                # $3
+    WARP_TUNNEL_ENDPOINT or "",     # $4
+    str(WARP_SVC_WAIT_TIMEOUT),     # $5
+]
 
 async def run_command(
     script_name: str,
     timeout: Optional[float] = None,
 ):
-    COMMAND_PATH = PROJECT_ROOT / "command"
+    # Linux 平台使用 bash 脚本
     if sys.platform == "linux":
-        command_file = COMMAND_PATH / "linux" / f"{script_name}.sh"
+        command_file = SHARED_COMMAND_DIR_PATH / sys.platform / f"{script_name}.sh"
+        SUDO_REFRESH_INTERVAL = settings.sudo_refresh_interval
         command = [
             "bash",
             str(command_file),
+            *SHARED_COMMAND_ARGS,
+            # Linux 专属
+            str(SUDO_REFRESH_INTERVAL),     # $6
         ]
+    # ~ Future Work
+    # Windows 平台使用 bat 脚本
     elif sys.platform == "win32":
+        command_file = SHARED_COMMAND_DIR_PATH / sys.platform / f"{script_name}.bat"
+        command = [
+            "cmd.exe",
+            "/c",
+            str(command_file),
+            *SHARED_COMMAND_ARGS,
+        ]
         raise NotImplementedError(
             "Windows platform is not supported yet."
         )
+    # 其余平台不支持
     else:
         raise NotImplementedError(
             f"Unsupported platform: {sys.platform}"
         )
 
-    # 启动脚本, 所有可调参数统一来自 Settings, 按位置传入
-    # 顺序需与 command/<平台>/ 下脚本的参数接收顺序保持一致
-    process = await asyncio.create_subprocess_exec(
-        *command,
-        TCP_HOST,                       # $1
-        str(TCP_PORT),                  # $2
-        str(HTTPS_PORT),                # $3
-        WARP_TUNNEL_ENDPOINT or "",     # $4
-        str(WARP_SVC_WAIT_TIMEOUT),     # $5
-        str(SUDO_REFRESH_INTERVAL),     # $6
-    )
-
+    # 启动脚本
+    process = await asyncio.create_subprocess_exec(*command)
     try:
-        return_code = await asyncio.wait_for(process.wait(), timeout)
+        return_code = await asyncio.wait_for(
+            process.wait(),
+            timeout
+        )
     except TimeoutError:
         process.kill()
         await process.wait()
@@ -102,45 +117,53 @@ async def run_command(
             f"Failed to run command '{script_name}' with return code {return_code}."
         )
 
-async def connect_warp():
+async def connect_warp_command():
     process = await asyncio.create_subprocess_exec(
         "warp-cli",
         "connect",
     )
 
+    # 当 warp-cli connect 命令返回非 0 时
     if await process.wait() != 0:
-        raise RuntimeError("Failed to connect WARP.")
+        raise RuntimeError(
+            "Failed to connect WARP."
+        )
 
-async def wait_warp_connected(
-    timeout: float = WARP_CONNECT_WAIT_TIMEOUT,
-) -> None:
-    # warp-cli connect 只是发出连接请求, 立即返回
-    # 这里轮询 WARP 状态, 真正连上后再记录日志
+async def wait_warp_connected():
+    # 当前事件循环
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
+    # 计算截止时间戳
+    deadline = loop.time() + WARP_CONNECT_WAIT_TIMEOUT
 
+    # 当前事件小于截止时间, 循环检查 WARP 连接状态
     while loop.time() < deadline:
         process = await asyncio.create_subprocess_exec(
             "warp-cli",
             "status",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,      # 捕获标准输出
+            stderr=asyncio.subprocess.DEVNULL,   # 忽略标准错误输出
         )
+        # 等待进程结束并获取输出
         stdout, _ = await process.communicate()
-        if b"Status update: Connected" in stdout:
+
+        # 检查输出中是否包含 "Status update: Connected"
+        warp_connected_msg = b"Status update: Connected"
+        if warp_connected_msg in stdout:
             logger.info("WARP connected.")
             return
+        # 如果没有连接成功, 等待 1 秒后再次检查
         await asyncio.sleep(1)
 
     logger.warning(
-        f"WARP is not connected after {timeout:.0f}s, "
+        f"WARP is not connected after {WARP_CONNECT_WAIT_TIMEOUT:.0f}s, "
         f"check `warp-cli status`."
     )
 
 @asynccontextmanager
 async def lifespan(
     app: FastAPI,
-) -> "AsyncGenerator[None, None]":
+):
+    # 启动 TCP 服务, 接收客户端连接
     tcp_connections = TCPConnections()
     tcp_server = await asyncio.start_server(
         tcp_connections.accept,
@@ -148,24 +171,39 @@ async def lifespan(
         port=TCP_PORT,
     )
     # 打印日志
-    logger.info(f"WARP TCP bridge starting to listen on {TCP_HOST}:{TCP_PORT}")
+    logger.info(
+        f"WARP TCP bridge starting to listen on {TCP_HOST}:{TCP_PORT}"
+    )
 
-    wait_task: Optional["asyncio.Task[None]"] = None
+    # 初始一个 WARP 连接等待任务
+    wait_warp_connect_task: Optional["Task[None]"] = None
     try:
-        await connect_warp()
-        # 后台等待 WARP 连上, 不阻塞服务启动
-        wait_task = asyncio.create_task(wait_warp_connected())
-        yield
-    finally:
-        if wait_task is not None and not wait_task.done():
-            wait_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await wait_task
+        # yield 前, 启动服务, 类似 Vue 的 onBeforeMount.
+        # uvicorn 会完成在 yield 前的逻辑, 才开始监听 HTTP
 
-        # 先停止接入, 再等待已有连接完成取消和清理
+        # 启动 WARP 连接, 并等待连接成功
+        await connect_warp_command()
+        wait_warp_connect_task = asyncio.create_task(
+            wait_warp_connected()
+        )
+        yield  # 服务运行中, 并不类似 Vue 的生命周期钩子
+        # yield 后, 关闭服务, 类似 Vue 的 onBeforeUnmount
+        # uvicorn 已经停止接收 HTTP
+    finally:
+        # 当服务关闭时, 取消 WARP 连接等待任务, 避免阻塞退出
+        if wait_warp_connect_task is not None \
+            and not wait_warp_connect_task.done():
+            # 取消等待 WARP 连接的任务
+            wait_warp_connect_task.cancel()
+            # 等待任务完成, 忽略 asyncios 的 CancelledError 异常
+            with suppress(asyncio.CancelledError):
+                await wait_warp_connect_task
+
+        # 关闭 TCP 服务, 停止接收客户端连接
         tcp_server.close()
         logger.info("TCP bridge shutting down...")
 
+        # 关闭所有正在转发的 TCP 连接, 等待任务完成
         await tcp_connections.close()
         await tcp_server.wait_closed()
 
@@ -229,31 +267,33 @@ if __name__ == "__main__":
     import signal
     import uvicorn
 
-    SERVER_PORT = settings.service_port
-    TRUSTED_PROXY_IPS = settings.trusted_proxy_ips
-    # 平台相关的退出信号, 由 Settings 按平台确定
-    SHUTDOWN_SIGNALS = settings.shutdown_signals
+    SERVER_PORT = settings.service_port             # 服务监听的 HTTP 端口
+    TRUSTED_PROXY_IPS = settings.trusted_proxy_ips  # 允许的代理 IP 地址列表
+    # 平台退出信号
+    # - SIGHUP: 1, 终端关闭 (Linux)
+    # - SIGBREAK: 21, 控制台 Ctrl+Break (Windows)
+    # - SIGINT: 2, Ctrl+C
+    # - SIGTERM: 15, kill <pid>
+    SHUTDOWN_SIGNALS = settings.shutdown_signals # Linux: (SIGHUP, )  Windows: (SIGBREAK, )
 
     file_stem = Path(__file__).stem
     serve_name: Final[str] = f"{file_stem}:app"
-
-    # =================== 退出信号处理 ===================
-    # 目标: 无论以何种方式退出, 都执行 finally 中的 close 脚本, 恢复 WARP 初始状态
-    # - Ctrl+C (SIGINT): Python 默认抛出 KeyboardInterrupt, 本身就会进入 finally
-    # - kill (SIGTERM): uvicorn 优雅关闭后会重新触发 SIGTERM, 默认处理会直接杀死进程,
-    #   跳过 finally; 因此改为抛出 SystemExit
-    # - 平台退出信号 (Linux 关闭终端 SIGHUP / Windows Ctrl+Break SIGBREAK):
-    #   默认直接退出, 跳过 finally; 因此转为 SIGTERM, 走同样的优雅关闭流程
-    # 信号处理函数会收到 (信号编号, 调用栈) 两个参数, 这里都不需要, 用 *_ 忽略
-    def exit_on_sigterm(*_: object) -> None:
-        raise SystemExit(1)
-
-    def forward_to_sigterm(*_: object) -> None:
-        signal.raise_signal(signal.SIGTERM)
-
-    signal.signal(signal.SIGTERM, exit_on_sigterm)
-    for shutdown_signal in SHUTDOWN_SIGNALS:
-        signal.signal(shutdown_signal, forward_to_sigterm)
+    # signal.signal 类似 JS 的 addEventListener("", () => {}) 监听事件
+    signal.signal(
+        signal.SIGTERM,  # 15, kill <pid>
+        # 收到 SIGTERM 信号时, 抛出异常
+        # 让 main 函数直接执行 finally 分支
+        lambda _s, _f: (_ for _ in ()).throw(SystemExit(1))
+    )
+    for s_signal in SHUTDOWN_SIGNALS:
+        # 当收到平台退出信号时, 手动触发 SIGTERM 信号 (kill <pid>), 进入 finally 分支
+        signal.signal(
+            s_signal,
+            # signal.raise_signal 类似 JS 的 target.dispatchEvent(event) 手动触发事件
+            # 收到退出信号时, 手动触发 SIGTERM 信号
+            # 因为 uvicorn 只监听 SIGTERM 和 SIGINT 信号, 其他信号不会触发 uvicorn 的 shutdown
+            lambda _s, _f: signal.raise_signal(signal.SIGTERM)
+        )
 
     try:
         # 启动设置脚本
@@ -274,10 +314,20 @@ if __name__ == "__main__":
             reload=DEV_MODE,
         )
     finally:
-        # 恢复过程中忽略退出信号, 避免再次 Ctrl+C 或终端关闭打断恢复
-        # 忽略状态会被 close 脚本及其子进程继承
-        for exit_signal in (signal.SIGINT, signal.SIGTERM, *SHUTDOWN_SIGNALS):
-            signal.signal(exit_signal, signal.SIG_IGN)
+        for e_s in (
+            signal.SIGINT,     # Ctrl+C
+            signal.SIGTERM,    # kill <pid>
+            *SHUTDOWN_SIGNALS  # 平台退出信号
+        ):
+            # 忽略退出信号, 避免再次 Ctrl+C, kill <pid> 等无法退出
+            signal.signal(
+                e_s,
+                signal.SIG_IGN   # 忽略退出信号
+            )
 
-        awaitable = run_command("close", timeout=CLOSE_COMMAND_TIMEOUT)
+        # 启动关闭设置脚本
+        awaitable = run_command(
+            "close",
+            timeout=CLOSE_COMMAND_TIMEOUT
+        )
         asyncio.run(awaitable)

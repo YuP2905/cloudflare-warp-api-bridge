@@ -12,19 +12,17 @@ import errno
 # settings
 from config import settings
 
-SOCKET_OPTIONS = settings.socket_options
-KEEPALIVE_OPTIONS = settings.keepalive_options
-WARP_INTERFACE_NAME = settings.cloudflare_warp_interface_name
+WARP_INTERFACE_NAME = settings.cloudflare_warp_interface_name  # WARP 网络接口名称
+SOCKET_OPTIONS = settings.socket_options                       # TCP Socket 选项, 用于绑定 WARP 网络接口
+KEEPALIVE_OPTIONS = settings.keepalive_options                 # TCP Socket Keepalive 选项, 用于定期探测连接状态
 
 class WarpInterfaceUnavailableError(OSError):
-    """WARP 网络接口不存在, 通常是隧道尚未建立或正在重连."""
+    """绑定 Socket 时找不到指定的 WARP 网络接口"""
+    pass
 
-def bind_warp_interface(
+def bind_socket_to_warp_network_interface(
     upstream_socket: "Socket",
-) -> None:
-    # 每次创建上游连接时, 都为新的 Socket 绑定 WARP 接口
-    # 此操作只指定出口接口, 不创建隧道, 也不修改系统路由
-    # 接口不存在或绑定失败时, 异常交给调用方处理, 不改用其他接口
+):
     try:
         upstream_socket.setsockopt(
             SOCKET_OPTIONS["level"],
@@ -32,22 +30,21 @@ def bind_warp_interface(
             SOCKET_OPTIONS["value"],
         )
     except OSError as e:
-        # 接口不存在 (隧道尚未建立或正在重连) 属于预期情况, 单独区分
-        if e.errno == errno.ENODEV:
+        if e.errno == errno.ENODEV:   # 19, 设备不存在时
+            # 捕获设备不存在的异常
             raise WarpInterfaceUnavailableError(
-                errno.ENODEV,
-                f"WARP interface '{WARP_INTERFACE_NAME}' does not exist",
+                f"WARP interface '{WARP_INTERFACE_NAME}' not found.",
             ) from e
+        # 其他 OSError 异常继续向上抛出
         raise
 
-def enable_keepalive(
+def enable_tcp_socket_keepalive(
     upstream_socket: "Socket",
-) -> None:
-    # 隧道中途断开时, 上游连接可能既收不到数据也收不到断开通知
-    # 开启 keepalive 后, 内核会定期探测, 失效时让读写报错, 从而关闭这条桥接连接
-    for option in KEEPALIVE_OPTIONS:
+):
+    # 开启 keepalive, 定期探测
+    for K_OP in KEEPALIVE_OPTIONS:
         upstream_socket.setsockopt(
-            option["level"],
-            option["optname"],
-            option["value"],
+            K_OP["level"],
+            K_OP["optname"],
+            K_OP["value"],
         )
