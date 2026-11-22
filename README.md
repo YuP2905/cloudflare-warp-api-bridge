@@ -34,7 +34,7 @@ WARP tunnel ──▶ Cloudflare control API (162.159.137.105 / 162.159.138.105 
 - **Forwards only, never decrypts**: the bridge passes TCP data through unchanged. TLS still runs end to end between the WARP client and Cloudflare, with Cloudflare's real certificate.
 - **On start**: start the WARP service → disconnect WARP → set the tunnel endpoint (optional) and the control API address → add the iptables redirect rule (Linux only) → start the bridge → connect WARP.
 - **On exit**: stop the bridge → disconnect WARP → restore the tunnel endpoint and the control API address → remove the iptables rule (Linux only).
-- **FastAPI service**: the program also runs a FastAPI service (`127.0.0.1:8765`), which currently only hosts the bridge's lifecycle.
+- **Standalone process**: the bridge is a plain asyncio TCP server with no web framework. The output of the start/stop scripts and `warp-cli` goes through the same logger as the program's own logs.
 
 ### Supported platforms
 
@@ -70,20 +70,18 @@ warp_tunnel_endpoint = 162.159.197.2:4500
 
 | Setting | Default | Description |
 |---|---|---|
-| `dev_mode` | `True` | Development mode; uvicorn reloads on file changes. Set it to `False` for daily use; **it must be `False` on Windows** |
+| `dev_mode` | `True` | Development mode: logs at DEBUG level with timestamps. Set it to `False` for daily use |
 | `warp_tunnel_endpoint` | none | Custom MASQUE tunnel endpoint, as `IPv4:UDP port`. If unset, WARP's default endpoint is used |
 | `tcp_host` | `127.0.0.1` | Address the bridge listens on; also written to WARP as the control API address |
-| `tcp_port` | Linux `8843`, Windows `443` | Port the bridge listens on. It must be 443 on Windows |
-| `service_port` | `8765` | Port of the FastAPI service |
+| `tcp_port` | `8843` | Port the bridge listens on. On Linux it must be 1024 or above (iptables redirects 443 to it). On Windows it is always forced to 443 |
 | `block_ips` | none | Client IPs to block, as JSON, e.g. `["192.168.1.10"]` |
-| `trusted_proxy_ips` | none | Trusted proxy IPs, used to read the real client IP |
 | `chunk_size` | `65536` | Maximum number of bytes read per forward |
 | `connect_timeout` | `4.0` | Timeout for connecting to the control API (seconds) |
 | `keepalive_idle` / `keepalive_interval` / `keepalive_count` | `30` / `10` / `3` | TCP keepalive for upstream connections, to notice a dropped tunnel quickly |
 | `warp_svc_wait_timeout` | `30` | Max time the start script waits for the WARP service to be ready (seconds) |
 | `warp_connect_wait_timeout` | `60` | Max time to wait for WARP to connect (seconds); only logs a warning on timeout |
 | `close_command_timeout` | `60` | Max run time of the restore script on exit (seconds) |
-| `sudo_refresh_interval` | `60` | Linux only: how often sudo authorization is refreshed while running (seconds) |
+| `sudo_refresh_interval` | `60` | Linux only: how often sudo authorization is refreshed while running (seconds, 1 to 900) |
 
 ### Running
 
@@ -108,7 +106,6 @@ Press Ctrl+C **once**. The program stops the bridge first, then restores the WAR
 | Windows | Ctrl+C, Ctrl+Break |
 
 - **Do not close the window on Windows**: after the window closes, Windows ends the process within about 5 seconds, which is not enough time to restore WARP.
-- **"Terminate batch job (Y/N)?" on Windows**: if this prompt appears while restoring, answer **N**.
 - **Cases that cannot be restored automatically**: `kill -9`, power loss, forced shutdown.
 
 ### Manual recovery after an abnormal exit
@@ -135,8 +132,9 @@ sudo iptables -t nat -D OUTPUT -p tcp -d 127.0.0.1 --dport 443 -j REDIRECT --to-
 ### Project structure
 
 ```
-├── main.py              # entry point: start/stop scripts, FastAPI app, lifecycle, exit signals
-├── config.py            # Settings, split by platform into LinuxSettings / WindowsSettings
+├── main.py              # entry point: start/stop scripts, TCP bridge server, exit signals
+├── config.py            # Settings; platform-specific values (socket options, signals, service name) are set here
+├── logger.py            # logger shared by the program and the script output
 ├── services/
 │   ├── tcp.py           # client connections: accept, track, close
 │   ├── bridge.py        # two-way forwarding for one connection
@@ -178,7 +176,7 @@ WARP 隧道 ──▶ Cloudflare 控制 API (162.159.137.105 / 162.159.138.105 :
 - **只转发，不解密**：桥接服务把 TCP 数据原样转发。TLS 仍然由 WARP 客户端和 Cloudflare 两端直接完成，证书是真正的 Cloudflare 证书。
 - **启动时**：启动 WARP 后台服务 → 断开 WARP → 设置隧道入口（可选）和控制 API 地址 → 添加 iptables 转发规则（仅 Linux） → 启动桥接服务 → 连接 WARP。
 - **退出时**：关闭桥接服务 → 断开 WARP → 恢复隧道入口和控制 API 地址 → 删除 iptables 规则（仅 Linux）。
-- **FastAPI 服务**：程序还会运行一个 FastAPI 服务（`127.0.0.1:8765`），目前只用来托管桥接服务的生命周期。
+- **独立进程**：桥接服务就是一个普通的 asyncio TCP 服务，不依赖任何 Web 框架。启停脚本和 `warp-cli` 的输出，与程序自身的日志使用同一个 logger 输出。
 
 ### 支持平台
 
@@ -214,20 +212,18 @@ warp_tunnel_endpoint = 162.159.197.2:4500
 
 | 配置项 | 默认值 | 说明 |
 |---|---|---|
-| `dev_mode` | `True` | 开发模式，开启后 uvicorn 会热重载。日常使用请设为 `False`，**Windows 上必须设为 `False`** |
+| `dev_mode` | `True` | 开发模式：输出 DEBUG 级别日志，并带时间戳。日常使用请设为 `False` |
 | `warp_tunnel_endpoint` | 无 | 自定义 MASQUE 隧道入口，格式为 `IPv4:UDP端口`。不设置则使用 WARP 默认入口 |
 | `tcp_host` | `127.0.0.1` | 桥接服务的监听地址，同时也会写入 WARP 作为控制 API 地址 |
-| `tcp_port` | Linux `8843`，Windows `443` | 桥接服务的监听端口。Windows 上只能是 443 |
-| `service_port` | `8765` | FastAPI 服务的端口 |
+| `tcp_port` | `8843` | 桥接服务的监听端口。Linux 上必须是 1024 及以上（由 iptables 把 443 转发过来）；Windows 上固定强制为 443 |
 | `block_ips` | 无 | 禁止访问的客户端 IP 列表，JSON 格式，例如 `["192.168.1.10"]` |
-| `trusted_proxy_ips` | 无 | 信任的代理 IP 列表，用来读取真实的客户端 IP |
 | `chunk_size` | `65536` | 转发时单次读取的最大字节数 |
 | `connect_timeout` | `4.0` | 连接控制 API 的超时时间（秒） |
 | `keepalive_idle` / `keepalive_interval` / `keepalive_count` | `30` / `10` / `3` | 上游连接的 TCP keepalive 参数，用来及时发现隧道断开 |
 | `warp_svc_wait_timeout` | `30` | 启动脚本等待 WARP 后台服务就绪的最长时间（秒） |
 | `warp_connect_wait_timeout` | `60` | 等待 WARP 连上的最长时间（秒），超时只记录警告 |
 | `close_command_timeout` | `60` | 退出时恢复脚本的最长执行时间（秒） |
-| `sudo_refresh_interval` | `60` | 仅 Linux：运行期间刷新 sudo 授权的间隔（秒） |
+| `sudo_refresh_interval` | `60` | 仅 Linux：运行期间刷新 sudo 授权的间隔（秒，1 到 900） |
 
 ### 运行
 
@@ -252,7 +248,6 @@ uv run python main.py
 | Windows | Ctrl+C、Ctrl+Break |
 
 - **Windows 上不要直接关闭窗口**：窗口关闭后，Windows 只等大约 5 秒就会结束进程，来不及恢复 WARP。
-- **Windows 上出现"终止批处理操作吗(Y/N)?"**：恢复过程中如果看到这个提示，请选 **N**。
 - **无法自动恢复的情况**：`kill -9`、断电、强制关机。
 
 ### 异常退出后手动恢复
@@ -279,8 +274,9 @@ sudo iptables -t nat -D OUTPUT -p tcp -d 127.0.0.1 --dport 443 -j REDIRECT --to-
 ### 项目结构
 
 ```
-├── main.py              # 程序入口: 启停脚本、FastAPI 应用、生命周期、退出信号处理
-├── config.py            # 配置 Settings, 按平台拆分为 LinuxSettings / WindowsSettings
+├── main.py              # 程序入口: 启停脚本、TCP 桥接服务、退出信号处理
+├── config.py            # 配置 Settings, 平台相关的值 (Socket 选项、退出信号、服务名称) 都在这里确定
+├── logger.py            # 日志, 程序自身和脚本输出共用
 ├── services/
 │   ├── tcp.py           # 管理客户端连接: 接收、登记、关闭
 │   ├── bridge.py        # 单个连接的双向转发
