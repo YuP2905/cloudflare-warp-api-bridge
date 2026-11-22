@@ -7,12 +7,12 @@ set "TCP_HOST=%~1"
 rem 网络适配配置
 set "WARP_TUNNEL_ENDPOINT=%~4"
 
-rem 启停流程配置 (统一在 config.py 的 Settings 中设置)
+rem 启停流程配置
 rem 等待 WARP 后台服务响应命令的最长时间 (秒)
 set "WARP_SVC_WAIT_TIMEOUT=%~5"
 
 rem WARP 后台服务 (warp-svc.exe) 的 Windows 服务名称
-set "WARP_SERVICE_NAME=CloudflareWARP"
+set "WARP_SERVICE_NAME=%~6"
 
 rem =================== WARP 后台服务 ===================
 rem 启动 WARP 后台服务, 已经在运行则跳过 (启动服务需要管理员权限)
@@ -28,8 +28,10 @@ rem 等待 WARP 后台服务可以响应命令
 set "WAITED=0"
 :wait_warp_svc
 warp-cli status >nul 2>&1 && goto warp_svc_ready
+rem 超时后再执行一次 warp-cli status, 不隐藏输出, 显示真实的错误 (例如 拒绝访问)
 if %WAITED% geq %WARP_SVC_WAIT_TIMEOUT% (
     echo warp-svc did not respond within %WARP_SVC_WAIT_TIMEOUT%s. 1>&2
+    warp-cli status 1>&2
     exit /b 1
 )
 rem 等待 1 秒: ping 本机两次, 间隔约 1 秒 (不依赖控制台输入, 比 timeout 命令稳定)

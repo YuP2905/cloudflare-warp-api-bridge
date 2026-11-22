@@ -10,9 +10,9 @@ if TYPE_CHECKING:
         Task,
     )
 
-from uvicorn.config import logger
 import asyncio
 
+from logger import logger
 from services.bridge import (
     handle_tcp_connection,
 )

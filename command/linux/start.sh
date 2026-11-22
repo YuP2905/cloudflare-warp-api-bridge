@@ -8,11 +8,13 @@ HTTPS_PORT="$3"
 # 网络适配配置
 WARP_TUNNEL_ENDPOINT="$4"
 
-# 启停流程配置 (统一在 config.py 的 Settings 中设置)
+# 启停流程配置
 # 等待 warp-svc 响应命令的最长时间 (秒)
 WARP_SVC_WAIT_TIMEOUT="$5"
+# WARP 后台服务名称
+WARP_SERVICE_NAME="$6"
 # 运行期间刷新 sudo 授权的间隔 (秒)
-SUDO_REFRESH_INTERVAL="$6"
+SUDO_REFRESH_INTERVAL="$7"
 
 # =================== sudo 授权 ===================
 # 启动时统一输入一次 sudo 密码
@@ -30,13 +32,13 @@ BRIDGE_PID="$PPID"
 ) </dev/null >/dev/null 2>&1 &
 
 # 启动 WARP 后台服务
-sudo systemctl start warp-svc
+sudo systemctl start "$WARP_SERVICE_NAME"
 
 # 等待 WARP 后台服务可以响应命令
 WAITED=0
 until warp-cli status >/dev/null 2>&1; do
-    if ! systemctl is-active --quiet warp-svc; then
-        echo "warp-svc is not active." >&2
+    if ! systemctl is-active --quiet "$WARP_SERVICE_NAME"; then
+        echo "$WARP_SERVICE_NAME is not active." >&2
         exit 1
     fi
     if [ "$WAITED" -ge "$WARP_SVC_WAIT_TIMEOUT" ]; then

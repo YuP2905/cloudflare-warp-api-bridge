@@ -5,6 +5,7 @@ from typing import (
     Optional,
     ClassVar,
     TypedDict,
+    cast,
     TYPE_CHECKING,
 )
 if TYPE_CHECKING:
@@ -35,11 +36,52 @@ import sys
 import signal
 import socket
 
+if sys.platform == "win32":
+    import errno
+    import ctypes
+    import struct
+
+    # Windows 自带的 iplhpapi.dll, 用于查询网络接口信息
+    IPHLPAPI = ctypes.WinDLL("iphlpapi")
+
+    def get_interface_index(
+        interface_name: str,
+    ):
+        # 先声明两个 ctypes 变量, 用于接收函数返回值
+        luid = ctypes.c_uint64()          #  Windows 网卡内部 ID, 8 字节无符号整型
+        interface_index = ctypes.c_ulong() # Windows 网卡编号, 4 字节无符号整型
+
+        # 网卡名称 ---> 网卡内部 ID
+        # 0 表示成功, 87 表示参数无效
+        alias_to_luid_status = IPHLPAPI.ConvertInterfaceAliasToLuid(
+            ctypes.c_wchar_p(interface_name),      # 输入参数: 网络接口名
+            ctypes.byref(luid)                     # 输出参数: Windows 网卡内部 ID
+        )
+        if alias_to_luid_status != 0:
+            raise OSError(
+                errno.ENODEV,    # 19, 设备不存在
+                f"WARP interface '{interface_name}' not found."
+            )
+
+        # 网卡内部 ID ---> 网卡编号
+        # 0 表示成功, 2 表示找不到指定的网卡
+        luid_to_index_status = IPHLPAPI.ConvertInterfaceLuidToIndex(
+            ctypes.byref(luid),                    # 输入参数: Windows 网卡内部 ID
+            ctypes.byref(interface_index)          # 输出参数: 接收 Windows 网卡编号
+        )
+        if luid_to_index_status != 0:
+            raise OSError(
+                errno.ENODEV,    # 19, 设备不存在
+                f"WARP interface '{interface_name}' disappeared while getting its index."
+            )
+
+        return interface_index.value
+
 class Settings(BaseSettings):
     # =================== 模式配置 ===================
     dev_mode: bool = Field(
         default=True,
-        description="Development mode."
+        description="Development mode"
     )
 
     # =================== 本地 TCP 桥接服务配置 ===================
@@ -50,6 +92,8 @@ class Settings(BaseSettings):
         description="TCP host."
     )
     # 本地 TCP 桥接服务的监听端口
+    # Linux 监听 443 时需要 root 权限, 监听其他端口时需要 iptables 转发
+    # Windows 没有特权端口限制, 直接监听 443. 会在 model_validator(mode="after") 中强制设置为 443.
     tcp_port: int = Field(
         default=8843,
         ge = 1,
@@ -57,25 +101,10 @@ class Settings(BaseSettings):
         description="TCP port."
     )
 
-    # FastAPI 服务的监听端口
-    service_port: int = Field(
-        default=8765,
-        # TCP 端口范围: 1-65535
-        ge = 1,
-        le = 65535,
-        description="Service port."
-    )
-
     # 客户端 IP 地址黑名单
     block_ips: Optional[List[IPvAnyAddress]] = Field(
         default=None,
         description="List of blocked IP addresses."
-    )
-    # 允许的代理 IP 地址列表, 用于信任代理头部信息
-    # 从而获取真实客户端 IP 地址
-    trusted_proxy_ips: Optional[List[str]] = Field(
-        default=None,
-        description="List of trusted proxy IP addresses."
     )
 
     # TCP 单次读取最大字节数
@@ -162,12 +191,124 @@ class Settings(BaseSettings):
     )
 
     # =================== 平台相关配置 ===================
-    # 以下内部属性由模型初始化时按平台确定, 不参与环境变量解析
-    # 其他模块只读取对应属性, 不再自行判断平台
+    # 运行期间刷新 sudo 授权的间隔 (秒)
+    # 必须小于 sudo 授权有效期 (默认 15 分钟), 保证退出时仍有授权
+    # Windows 没有 sudo 授权, 该配置项会在 model_validator(mode="after") 中被设置为 None
+    sudo_refresh_interval: Optional[int] = Field(
+        default=60,
+        ge=1,
+        le=900, # sudo 授权有效期默认 15 分钟, 900 秒
+        description="Seconds between sudo authorization refreshes while running.",
+    )
+
     # 上游 Socket 的 keepalive 选项
     _keepalive_options: "Optional[List[KeepaliveOption]]" = PrivateAttr(default=None)
     # 平台退出信号
     _shutdown_signals: Optional[Tuple[int]] = PrivateAttr(default=None)
+    # WARP 后台服务名称, 启动脚本启动服务
+    _warp_service_name: Optional[str] = PrivateAttr(default=None)
+    # 日志消息缓存, 用于在日志系统初始化前缓存日志消息
+    _log_message: List[str] = PrivateAttr(default_factory=list)
+
+    @model_validator(mode="after")
+    def init_platform_options(self):
+        # 通用 keepalive 选项
+        keepalive_options: "List[KeepaliveOption]" = [
+            {
+                "level": socket.SOL_SOCKET,             # 1, socket 通用选项
+                "optname": socket.SO_KEEPALIVE,         # 9, socket 保活选项
+                "value": 1                              # 1, 启用. 0 表示禁用
+            },
+            {
+                "level": socket.IPPROTO_TCP,            # 6, TCP 协议选项
+                "optname": socket.TCP_KEEPIDLE,         # 4, 空闲多少秒后开始探测
+                "value": self.keepalive_idle            # 连续空闲 self.keepalive_idle 秒后开始探测
+            },
+            {
+                "level": socket.IPPROTO_TCP,            # 6, TCP 协议选项
+                "optname": socket.TCP_KEEPINTVL,        # 5, 两次探测之间的间隔
+                "value": self.keepalive_interval        # 连续两次探测之间的间隔为 self.keepalive_interval 秒
+            },
+            {
+                "level": socket.IPPROTO_TCP,            # 6, TCP 协议选项
+                "optname": socket.TCP_KEEPCNT,          # 6, 连续多少次探测无响应后判定连接失效
+                "value": self.keepalive_count           # 连续 self.keepalive_count 次探测无响应后判定连接失效
+            },
+        ]
+        # =================== Linux ===================
+        if sys.platform == "linux":
+            # 设置了特权端口(即 1024 以下端口)
+            if self.tcp_port < 1024:
+                # Linux 监听 443 时需要 root 权限, 监听其他端口时需要 iptables 转发
+                raise ValueError(
+                    "On Linux, listening on ports below 1024 requires root privileges. "
+                    "Maybe you can use `sudo` to run this program, but I don't recommend it. "
+                    "Please use a port above 1024, and I already set up iptables to forward port 443 to a non-privileged port."
+                )
+
+            # WARP 后台服务名称: systemd 服务 warp-svc
+            self._warp_service_name = "warp-svc"
+
+            # 已发送数据长时间未被确认时的超时 (毫秒)
+            user_timeout_ms = (
+                self.keepalive_idle
+                + self.keepalive_interval * self.keepalive_count
+            ) * 1000
+            # Linux 的 TCP_USER_TIMEOUT 选项用于设置已发送数据长时间未被确认时的超时, 单位为毫秒
+            keepalive_options.append(
+                {
+                    "level": socket.IPPROTO_TCP,         # 6, TCP 协议选项
+                    "optname": socket.TCP_USER_TIMEOUT,  # 18, 已发送数据长时间未被确认时的超时
+                    "value": user_timeout_ms             # 超时为 user_timeout_ms 毫秒
+                }
+            )
+            self._keepalive_options = keepalive_options
+
+            # 关闭终端窗口
+            self._shutdown_signals = (
+                signal.SIGHUP,  # signal 1, 终端关闭
+            )
+        elif sys.platform == "win32":
+            # 当 tcp_port 不为 443 时 (不管是显式设置还是默认值), 提示
+            if self.tcp_port != 443:
+                # Windows 没有特权端口(即 1024 以下端口)的限制, 任何程序都能监听 443, 无需转发.
+                self._log_message.append(
+                    "On Windows, there is no privileged port restriction, so the tcp_port is forcibly set to 443."
+                )
+            # 当 sudo_refresh_interval 不为 None 时, 提示
+            if self.sudo_refresh_interval is not None:
+                # Windows 没有 sudo 授权
+                self._log_message.append(
+                    "On Windows, there is no sudo authorization, so the sudo_refresh_interval is forcibly set to None."
+                )
+
+            # 不管是显式设置还是默认值, 强制设置为 None
+            self.sudo_refresh_interval = None
+            self.tcp_port = self.https_port # 443
+
+            # WARP 后台服务名称: Windows 服务 CloudflareWARP (进程是 warp-svc.exe)
+            # 和网卡名称 cloudflare_warp_interface_name 恰好同名
+            self._warp_service_name = "CloudflareWARP"
+
+            self._keepalive_options = keepalive_options
+            self._shutdown_signals = (
+                signal.SIGBREAK, # signal 21, 控制台 Ctrl+Break
+            )
+        # =================== macOS ===================
+        # ! Not Gonna Work (不打算支持, 仅用于抛出异常提示)
+        elif sys.platform == "darwin":
+            raise NotImplementedError(
+                "I'm not gonna support MacOS. Because I don't like f**king closed systems like MacOS."
+            )
+        # =================== 其他平台 ===================
+        # ! 本人孤陋寡闻, 仅知道 windows 和 linux (仅用于抛出异常提示, 更不会支持了)
+        else:
+            raise NotImplementedError(
+                f"Forgive my ignorance, I really don't know what platform '{sys.platform}' is, "
+                "and I'm not gonna support it."
+            )
+
+        return self
 
     @property
     def keepalive_options(self):
@@ -178,12 +319,52 @@ class Settings(BaseSettings):
         return self._keepalive_options
 
     @property
+    def warp_service_name(self):
+        if self._warp_service_name is None:
+            raise RuntimeError(
+                "WARP service name not initialized. "
+            )
+        return self._warp_service_name
+
+    @property
     def shutdown_signals(self):
         if self._shutdown_signals is None:
             raise RuntimeError(
                 "Shutdown signals not initialized. "
             )
         return self._shutdown_signals
+
+    @property
+    def log_message(self):
+        return self._log_message
+
+    def get_socket_options(self):
+        # 每次绑定上游 Socket 时调用, 返回绑定 WARP 网络接口的 Socket 选项
+        # 用方法而不是 property: Windows 每次都要调用系统函数查网卡编号, 网卡不存在时会抛出 OSError
+        if sys.platform == "linux":
+            # 设置 Socket 选项
+            # Linux 的 SO_BINDTODEVICE 直接使用网络接口名称, 内容固定不变
+            # 由内核在每次 setsockopt 时查找网络接口, 不存在时抛出 ENODEV
+            socket_options = {
+                "level": socket.SOL_SOCKET,              # 1, socket 通用设置
+                "optname": socket.SO_BINDTODEVICE,       # 25, 绑定到指定网络接口
+                "value": self.cloudflare_warp_interface_name.encode("utf-8") \
+                    + b'\0',                             # 指定的网络接口名称 "CloudflareWARP" + b'\0'(0 字节, 字符串结束标记)
+            }
+        else:
+            # Windows (其他平台在 init_platform_options 中已经抛出异常, 不会走到这里)
+            # 设置 Socket 选项
+            # Windows 的 IP_UNICAST_IF 需要网卡编号, 不能直接使用网络接口名称
+            # 也不能使用 socket.if_nametoindex, 因为 Windows 上只认 "ethernet_0" 这类内部名称不能直接使用网络接口名称
+            interface_index = get_interface_index(
+                self.cloudflare_warp_interface_name
+            )
+            socket_options = {
+                "level": socket.IPPROTO_IP,                      # 0, IP 协议选项
+                "optname": 31,                                   # IP_UNICAST_IF, 绑定到指定网络接口
+                "value": struct.pack("!I", interface_index),     # 将网络接口索引转换为 4 字节的网络字节序 bytes
+            }
+        return cast("SocketOptions", socket_options)
 
     model_config = SettingsConfigDict(
         env_file=[".env", ],
@@ -198,191 +379,4 @@ class Settings(BaseSettings):
         case_sensitive=True,
     )
 
-# ================== Linux ===================
-if sys.platform == "linux":
-    class LinuxSettings(Settings):
-        # Linux 平台的设置
-
-        # 运行期间刷新 sudo 授权的间隔 (秒)
-        # 必须小于 sudo 授权有效期 (默认 15 分钟), 保证退出时仍有授权
-        sudo_refresh_interval: int = Field(
-            default=60,
-            ge=1,
-            description="Seconds between sudo authorization refreshes while running.",
-        )
-
-        @model_validator(mode="after")
-        def init_platform_options(self):
-            # 已发送数据长时间未被确认时的超时 (毫秒)
-            user_timeout_ms = (
-                self.keepalive_idle
-                + self.keepalive_interval * self.keepalive_count
-            ) * 1000
-
-            self._keepalive_options = [
-                {
-                    "level": socket.SOL_SOCKET,          # 1, socket 通用选项
-                    "optname": socket.SO_KEEPALIVE,      # 9, 是否启用 keepalive(存活) 探测
-                    "value": 1                           # 1, 启用. 0 表示禁用
-                },
-                {
-                    "level": socket.IPPROTO_TCP,         # 6, TCP 协议选项
-                    "optname": socket.TCP_KEEPIDLE,      # 4, 空闲多少秒后开始探测
-                    "value": self.keepalive_idle         # 连续空闲 self.keepalive_idle 秒后开始探测
-                },
-                {
-                    "level": socket.IPPROTO_TCP,         # 6, TCP 协议选项
-                    "optname": socket.TCP_KEEPINTVL,     # 5, 两次探测之间的间隔
-                    "value": self.keepalive_interval     # 连续两次探测之间的间隔为 self.keepalive_interval 秒
-                },
-                {
-                    "level": socket.IPPROTO_TCP,         # 6, TCP 协议选项
-                    "optname": socket.TCP_KEEPCNT,       # 6, 连续多少次探测无响应后判定连接失效
-                    "value": self.keepalive_count        # 连续 self.keepalive_count 次探测无响应后判定连接失效
-                },
-                {
-                    "level": socket.IPPROTO_TCP,         # 6, TCP 协议选项
-                    "optname": socket.TCP_USER_TIMEOUT,  # 18, 已发送数据长时间未被确认时的超时
-                    "value": user_timeout_ms             # 超时为 user_timeout_ms 毫秒
-                },
-            ]
-            # 关闭终端窗口
-            self._shutdown_signals = (
-                signal.SIGHUP,  # signal 1, 终端关闭
-            )
-            return self
-
-        def get_socket_options(self):
-            # 将上游 Socket 绑定到 WARP 网络接口的 Socket 选项
-            # Linux 的 SO_BINDTODEVICE 直接使用网络接口名称, 内容固定不变
-            # 由内核在每次 setsockopt 时查找网络接口, 不存在时抛出 ENODEV
-            socket_options: "SocketOptions" = {
-                "level": socket.SOL_SOCKET,              # 1, socket 通用设置
-                "optname": socket.SO_BINDTODEVICE,       # 25, 绑定到指定网络接口
-                "value": self.cloudflare_warp_interface_name.encode("utf-8") \
-                    + b'\0',                             # 指定的网络接口名称 "CloudflareWARP" + b'\0'(0 字节, 字符串结束标记)
-            }
-            return socket_options
-
-    settings = LinuxSettings()
-
-# =================== Windows ===================
-elif sys.platform == "win32":
-    import errno
-    import struct
-    import ctypes
-    from ctypes import (
-        wintypes,
-        Structure,
-    )
-
-    # Windows 网络接口的唯一标识 LUID, 对应 C 结构体 NET_LUID
-    class NET_LUID(Structure):
-        _fields_ = [
-            ("Value", ctypes.c_ulonglong),
-        ]
-
-    # Windows IP Helper API, 用于查询网络接口信息
-    IPHLPAPI = ctypes.WinDLL("iphlpapi")
-
-    def get_interface_index(
-        interface_name: str,
-    ):
-        # 根据网络接口名称 (例如 "CloudflareWARP") 获取 Windows 网络接口索引
-        # socket.if_nametoindex 在 Windows 上只认 "ethernet_0" 这类内部名称, 不认网络接口名称
-        # 因此通过 IP Helper 分两步查找: 网络接口名称 --> LUID --> 网络接口索引
-        luid = NET_LUID()
-        interface_index = wintypes.ULONG()
-
-        # 两个函数都返回 0 表示成功
-        # 网络接口不存在时 (例如 WARP 未连接), 第一步返回 87 (ERROR_INVALID_PARAMETER)
-        is_interface_found = IPHLPAPI.ConvertInterfaceAliasToLuid(
-            interface_name,
-            ctypes.byref(luid),
-        ) == 0 \
-        and IPHLPAPI.ConvertInterfaceLuidToIndex(
-            ctypes.byref(luid),
-            ctypes.byref(interface_index),
-        ) == 0
-
-        if not is_interface_found:
-            # 与 Linux 绑定不存在的网络接口时的错误保持一致
-            # services/network.py 会将 ENODEV 转换为 WarpInterfaceUnavailableError
-            raise OSError(
-                errno.ENODEV,   # 19, 设备不存在
-                f"WARP interface '{interface_name}' not found.",
-            )
-        return interface_index.value
-
-    class WindowsSettings(Settings):
-        # Windows 平台的设置
-
-        # 本地 TCP 桥接服务的监听端口
-        # Windows 没有特权端口限制, 直接监听 443, 不要像 Linux 那样用 iptables 转发
-        # 没有端口转发, 因此只能是 443 (ge=443, le=443), 改成其他值会在启动时校验失败
-        tcp_port: int = Field(
-            default=443,
-            ge = 443,
-            le = 443,
-            description="TCP port."
-        )
-
-        @model_validator(mode="after")
-        def init_platform_options(self):
-            self._keepalive_options = [
-                {
-                    "level": socket.SOL_SOCKET,             # 1, socket 通用选项
-                    "optname": socket.SO_KEEPALIVE,         # 9, socket 保活选项
-                    "value": 1                              # 1, 启用. 0 表示禁用
-                },
-                {
-                    "level": socket.IPPROTO_TCP,            # 6, TCP 协议选项
-                    "optname": socket.TCP_KEEPIDLE,         # 4, 空闲多少秒后开始探测
-                    "value": self.keepalive_idle            # 连续空闲 self.keepalive_idle 秒后开始探测
-                },
-                {
-                    "level": socket.IPPROTO_TCP,            # 6, TCP 协议选项
-                    "optname": socket.TCP_KEEPINTVL,        # 5, 两次探测之间的间隔
-                    "value": self.keepalive_interval        # 连续两次探测之间的间隔为 self.keepalive_interval 秒
-                },
-                {
-                    "level": socket.IPPROTO_TCP,            # 6, TCP 协议选项
-                    "optname": socket.TCP_KEEPCNT,          # 6, 连续多少次探测无响应后判定连接失效
-                    "value": self.keepalive_count           # 连续 self.keepalive_count 次探测无响应后判定连接失效
-                },
-            ]
-            # 控制台 Ctrl+Break
-            self._shutdown_signals = (
-                signal.SIGBREAK, # signal 21, 控制台 Ctrl+Break
-            )
-            return self
-
-        def get_socket_options(self):
-            # 将上游 Socket 绑定到 WARP 网络接口的 Socket 选项
-            # Windows 的 IP_UNICAST_IF 需要网络接口索引, 不能直接使用网络接口名称
-            # 每次绑定时重新获取: WARP 连接后才会创建该网络接口, 重新连接后索引可能变化
-            interface_index = get_interface_index(
-                self.cloudflare_warp_interface_name
-            )
-            socket_options: "SocketOptions" = {
-                "level": socket.IPPROTO_IP,                   # 0
-                "optname": 31,                                # IP_UNICAST_IF
-                "value": struct.pack("!I", interface_index),  # 将网络接口索引转换为 4 字节的网络字节序 bytes
-            }
-            return socket_options
-
-    settings = WindowsSettings()
-
-# =================== macOS ===================
-# ! Not Gonna Work (不打算支持, 仅用于抛出异常提示)
-elif sys.platform == "darwin":
-    raise NotImplementedError(
-        "I'm not gonna support MacOS. Because I don't like f**king closed systems like MacOS."
-    )
-# =================== 其他平台 ===================
-# ! 本人孤陋寡闻, 仅知道 windows 和 linux (仅用于抛出异常提示, 更不会支持了)
-else:
-    raise NotImplementedError(
-        f"Forgive my ignorance, I really don't know what platform '{sys.platform}' is, "
-        "and I'm not gonna support it."
-    )
+settings = Settings()

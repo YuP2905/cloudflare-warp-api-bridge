@@ -13,7 +13,6 @@ if TYPE_CHECKING:
 
 from contextlib import suppress
 from ipaddress import ip_address
-from uvicorn.config import logger
 
 import socket
 import asyncio
@@ -23,6 +22,7 @@ from services.network import (
     enable_tcp_socket_keepalive,
     WarpInterfaceUnavailableError,
 )
+from logger import logger
 from config import settings
 
 # Settings
